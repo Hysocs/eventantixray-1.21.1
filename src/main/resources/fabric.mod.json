@@ -1,0 +1,53 @@
+{
+	"schemaVersion": 1,
+	"id": "eventantixray",
+	"version": "${version}",
+	"name": "EventAntiXray",
+	"description": "This is a Simple event based anti xray mod",
+	"authors": [
+		"Hysocs"
+	],
+	"contact": {
+		"discord": "https://discord.gg/KQyPEye7CT"
+	},
+	"license": "GNU Lesser General Public License v3",
+	"icon": "assets/eventantixray/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			{
+				"value": "com.eventantixray.EventAntiXray",
+				"adapter": "kotlin"
+			}
+		],
+		"client": [
+			{
+				"value": "com.eventantixray.EventAntiXrayClient",
+				"adapter": "kotlin"
+			}
+		],
+		"fabric-datagen": [
+			{
+				"value": "com.eventantixray.EventAntiXrayDataGenerator",
+				"adapter": "kotlin"
+			}
+		]
+	},
+	"mixins": [
+		"eventantixray.mixins.json",
+		{
+			"config": "eventantixray.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.14.10",
+		"minecraft": "~1.21.1",
+		"java": ">=21",
+		"fabric-api": "*",
+		"fabric-language-kotlin": "*"
+	},
+	"suggests": {
+		"another-mod": "*"
+	}
+}
