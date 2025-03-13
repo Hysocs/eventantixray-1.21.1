@@ -4,6 +4,7 @@ import com.everlastingutils.command.CommandManager
 import com.eventantixray.utils.EventAntiXrayCommands
 import com.eventantixray.utils.EventAntiXrayConfig
 import com.eventantixray.utils.EventAntiXrayWebhook
+import com.everlastingutils.colors.KyoriHelper
 import com.everlastingutils.utils.LogDebug
 import net.fabricmc.api.ModInitializer
 import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents
@@ -86,8 +87,17 @@ class EventAntiXray : ModInitializer {
 		ServerPlayConnectionEvents.JOIN.register { handler, _, _ ->
 			val player = handler.player
 			val permissionNode = EventAntiXrayConfig.config.general.notifyPermission
-			permissionCache[player.uuid] = player.hasPermission(permissionNode) || player.hasPermissionLevel(3)
-			LogDebug.debug(MOD_ID, "Updated permission cache for ${player.name.string}")
+			val source = player.server.commandSource.withEntity(player).withPosition(player.pos)
+
+			// Use CommandManager to check permissions properly
+			permissionCache[player.uuid] = CommandManager.hasPermissionOrOp(
+				source,
+				permissionNode,
+				EventAntiXrayConfig.config.general.permissionLevel ?: 2,
+				EventAntiXrayConfig.config.general.opLevel ?: 2
+			)
+
+			LogDebug.debug(MOD_ID, "Updated permission cache for ${player.name.string}: ${permissionCache[player.uuid]}")
 		}
 
 		ServerPlayConnectionEvents.DISCONNECT.register { handler, _ ->
@@ -170,19 +180,26 @@ class EventAntiXray : ModInitializer {
 	) {
 		val server = player.server
 		val blockName = EventAntiXrayConfig.getFormattedBlockName(blockId)
-		val messageTemplate = EventAntiXrayConfig.getParsedAlertMessage(blockId)
-		val messageText = messageTemplate.copy()
-		val messageStr = messageText.string
-			.replace("%%PLAYER%%", player.name.string)
-			.replace("%%COUNT%%", count.toString())
-			.replace("%%TIME%%", "${timeWindow.toMinutes()} minutes")
-			.replace("%%BLOCK%%", blockName)
-		val finalMessage = Text.literal(messageStr)
-		val finalText = if (consecutiveAlertCount > 1) {
-			EventAntiXrayConfig.getParsedContinuedPrefix().copy().append(finalMessage)
+
+		// Get the raw message template string
+		val messageTemplate = EventAntiXrayConfig.getAlertMessageForBlock(blockId)
+
+		// Replace the placeholders in the raw string
+		val messageStr = messageTemplate
+			.replace("{player}", player.name.string)
+			.replace("{count}", count.toString())
+			.replace("{time}", "${timeWindow.toMinutes()} minutes")
+			.replace("{block}", blockName)
+
+		// Add the continued prefix if needed
+		val finalMessageStr = if (consecutiveAlertCount > 1) {
+			EventAntiXrayConfig.config.alerts.continuedAlertPrefix + messageStr
 		} else {
-			finalMessage
+			messageStr
 		}
+
+		// Use KyoriHelper to parse the MiniMessage format
+		val finalMessage = KyoriHelper.parseToMinecraft(finalMessageStr, server.registryManager)
 
 		LogDebug.debug(MOD_ID, "Sending alert to staff for ${player.name.string}, count: $count")
 
@@ -199,14 +216,14 @@ class EventAntiXray : ModInitializer {
 			if (soundEvent != null) {
 				val volume = soundConfig.baseVolume * (soundConfig.volumeMultiplierPerAlert.pow(consecutiveAlertCount - 1))
 				val pitch = soundConfig.basePitch * (soundConfig.pitchMultiplierPerAlert.pow(consecutiveAlertCount - 1))
-				broadcastToStaff(server, finalText, soundEvent, volume, pitch)
+				broadcastToStaff(server, finalMessage, soundEvent, volume, pitch)
 			} else {
 				logger.warn("Sound event not found: ${soundConfig.soundId}")
-				broadcastToStaff(server, finalText, null, 0f, 0f)
+				broadcastToStaff(server, finalMessage, null, 0f, 0f)
 			}
 		} else {
 			logger.warn("Invalid sound ID: ${soundConfig.soundId}")
-			broadcastToStaff(server, finalText, null, 0f, 0f)
+			broadcastToStaff(server, finalMessage, null, 0f, 0f)
 		}
 
 		// Asynchronous webhook handling
@@ -252,7 +269,12 @@ class EventAntiXray : ModInitializer {
 
 	private fun ServerPlayerEntity.hasPermission(permission: String): Boolean {
 		val source = server.commandSource.withEntity(this).withPosition(pos)
-		return CommandManager.hasPermissionOrOp(source, permission, 2, 2)
+		return CommandManager.hasPermissionOrOp(
+			source,
+			permission,
+			EventAntiXrayConfig.config.general.permissionLevel ?: 2,
+			EventAntiXrayConfig.config.general.opLevel ?: 2
+		)
 	}
 
 	private fun scheduleCleanupTask() {

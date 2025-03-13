@@ -7,7 +7,6 @@ import com.everlastingutils.utils.LogDebug
 import com.everlastingutils.colors.KyoriHelper
 import com.google.gson.annotations.SerializedName
 import kotlinx.coroutines.runBlocking
-import net.minecraft.text.Text
 import net.minecraft.util.Identifier
 import org.slf4j.LoggerFactory
 import java.util.concurrent.ConcurrentHashMap
@@ -89,8 +88,9 @@ data class EventAntiXrayConfigData(
 
 // Data class for general settings
 data class GeneralSettings(
-    @SerializedName("notify_permission")
-    val notifyPermission: String = "antixray.notify"
+    val notifyPermission: String = "antixray.notify",
+    val permissionLevel: Int = 2,
+    val opLevel: Int = 2
 )
 
 // Data class for alert settings
@@ -140,12 +140,6 @@ object EventAntiXrayConfig {
 
     // Use Identifier for faster lookups
     private val trackedBlocksMap = mutableMapOf<Identifier, TrackedBlockData>()
-
-    // Cache for pre-parsed message templates
-    private val parsedMessageCache = ConcurrentHashMap<Identifier, Text>()
-
-    // Continued alert prefix, parsed once
-    private lateinit var parsedContinuedPrefix: Text
 
     private val configMetadata = ConfigMetadata(
         headerComments = listOf(
@@ -239,8 +233,7 @@ object EventAntiXrayConfig {
         LogDebug.debug("Configuration loaded, updating debug state...", MOD_ID)
         updateDebugState()
         parseTrackedBlocks()
-        preParseMessages()
-        LogDebug.debug("Blocks parsed and messages pre-parsed", MOD_ID)
+        LogDebug.debug("Blocks parsed", MOD_ID)
     }
 
     fun reloadBlocking() {
@@ -249,7 +242,6 @@ object EventAntiXrayConfig {
             configManager.reloadConfig()
             updateDebugState()
             parseTrackedBlocks()
-            preParseMessages()
             LogDebug.debug("Reload complete", MOD_ID)
         }
     }
@@ -258,41 +250,6 @@ object EventAntiXrayConfig {
         val debugEnabled = configManager.getCurrentConfig().debug.enabled
         LogDebug.setDebugEnabledForMod(MOD_ID, debugEnabled)
         LogDebug.debug("Debug state updated to: $debugEnabled", MOD_ID)
-    }
-
-    /**
-     * Pre-parses all alert messages for improved performance.
-     * This replaces the placeholder markers with special tokens that can be
-     * efficiently replaced at runtime.
-     */
-    private fun preParseMessages() {
-        parsedMessageCache.clear()
-
-        // Parse the continued alert prefix
-        parsedContinuedPrefix = KyoriHelper.parseToMinecraft(config.alerts.continuedAlertPrefix)
-        LogDebug.debug("Pre-parsed continued alert prefix", MOD_ID)
-
-        // Parse each block's message template
-        trackedBlocksMap.forEach { (blockId, data) ->
-            // We'll parse the message with placeholder tokens that can be replaced later
-            val message = data.alertMessage
-                .replace("{player}", "%%PLAYER%%")
-                .replace("{count}", "%%COUNT%%")
-                .replace("{time}", "%%TIME%%")
-                .replace("{block}", "%%BLOCK%%")
-
-            try {
-                val parsed = KyoriHelper.parseToMinecraft(message)
-                parsedMessageCache[blockId] = parsed
-                LogDebug.debug("Pre-parsed message for $blockId", MOD_ID)
-            } catch (e: Exception) {
-                logger.error("Failed to parse message template for $blockId: ${e.message}")
-                // Fallback to a simple text message
-                parsedMessageCache[blockId] = Text.literal(message)
-            }
-        }
-
-        logger.info("Pre-parsed ${parsedMessageCache.size} alert messages")
     }
 
     val config: EventAntiXrayConfigData
@@ -323,23 +280,6 @@ object EventAntiXrayConfig {
     }
 
     fun getTrackedBlock(blockId: Identifier): TrackedBlockData? = trackedBlocksMap[blockId]
-
-    /**
-     * Gets the pre-parsed alert message Text component for a block
-     * with placeholder tokens that will be replaced at runtime.
-     */
-    fun getParsedAlertMessage(blockId: Identifier): Text {
-        return parsedMessageCache[blockId] ?: Text.literal(
-            "AntiXray Alert: Player broke suspicious number of blocks."
-        )
-    }
-
-    /**
-     * Returns the pre-parsed continued alert prefix
-     */
-    fun getParsedContinuedPrefix(): Text {
-        return parsedContinuedPrefix
-    }
 
     /**
      * Gets the original alert message format string
