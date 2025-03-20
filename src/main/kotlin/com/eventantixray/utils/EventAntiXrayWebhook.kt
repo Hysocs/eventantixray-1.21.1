@@ -19,21 +19,23 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import net.minecraft.util.math.BlockPos
 
 object EventAntiXrayWebhook {
     private val logger = LoggerFactory.getLogger("EventAntiXrayWebhook")
     private val MOD_ID = "eventantixray"
-    private val VERSION = "1.0" // Add your mod version here
+    private val VERSION = "1.0.1" // Add your mod version here
 
     // Date formatter for readable timestamps
     private val dateFormatter = DateTimeFormatter
         .ofPattern("yyyy-MM-dd HH:mm:ss")
         .withZone(ZoneId.systemDefault())
 
-    // Cache structure to include last update time for cleanup
+    // Cache structure to include last update time and list of positions
     private data class CachedMessage(
-        val messageId: String,
-        var lastUpdated: Instant
+        var messageId: String,
+        var lastUpdated: Instant,
+        val positions: MutableList<BlockPos> = mutableListOf()
     )
     private val webhookMessageCache = ConcurrentHashMap<String, CachedMessage>()
 
@@ -60,16 +62,12 @@ object EventAntiXrayWebhook {
         var itemCount = 0
         val maxItems = 10 // Maximum number of items to show
 
-        // Process hotbar and main inventory (most important items first)
         for (i in 0 until player.inventory.size()) {
             val stack = player.inventory.getStack(i)
             if (!stack.isEmpty) {
-                // Format: Item Name x Count (or just Item Name if count is 1)
                 val itemName = stack.name.string
                 val count = if (stack.count > 1) " x${stack.count}" else ""
-
                 sb.append(itemName).append(count).append("\n")
-
                 itemCount++
                 if (itemCount >= maxItems) {
                     sb.append("...(more items not shown)")
@@ -91,17 +89,16 @@ object EventAntiXrayWebhook {
         blockId: Identifier,
         count: Int,
         timeWindow: Duration,
-        consecutiveAlertCount: Int
+        consecutiveAlertCount: Int,
+        recentPos: BlockPos
     ) {
         try {
-            // Ensure the webhook URL has a protocol
             val fullWebhookUrl = if (webhookUrl.startsWith("http://") || webhookUrl.startsWith("https://")) {
                 webhookUrl
             } else {
                 "https://discord.com/api/webhooks/$webhookUrl"
             }
 
-            // Gather data for the webhook message
             val playerName = player.name.string
             val playerUuid = player.uuidAsString
             val blockName = EventAntiXrayConfig.getFormattedBlockName(blockId)
@@ -109,13 +106,22 @@ object EventAntiXrayWebhook {
             val timestamp = Instant.now()
             val formattedTimestamp = dateFormatter.format(timestamp)
             val cacheKey = "${playerUuid}:${blockId}"
-            val cachedMessage = webhookMessageCache[cacheKey]
+            val cachedMessage = webhookMessageCache.getOrPut(cacheKey) {
+                CachedMessage("", Instant.now())
+            }
 
-            // Get player's current inventory contents
+            // Add the recent position to the list
+            cachedMessage.positions.add(recentPos)
+
             val inventoryContents = getPlayerInventoryItems(player)
 
             val description = "Player $playerName has mined $count $blockName in $timeMinutes minutes!"
             val continuedAlert = if (consecutiveAlertCount > 1) "Yes (Alert #$consecutiveAlertCount)" else "No"
+
+            // Format the list of positions including X, Y, and Z
+            val positionsList = cachedMessage.positions.joinToString("\n") { pos ->
+                "X: ${pos.x}, Y: ${pos.y}, Z: ${pos.z}"
+            }
 
             fun escape(input: String): String = input.replace("\n", "\\n").replace("\"", "\\\"")
 
@@ -125,6 +131,7 @@ object EventAntiXrayWebhook {
             val safeContinuedAlert = escape(continuedAlert)
             val safeInventoryContents = escape(inventoryContents)
             val safeFormattedTimestamp = escape(formattedTimestamp)
+            val safePositionsList = escape(positionsList)
 
             val jsonPayload = """
             {
@@ -155,6 +162,11 @@ object EventAntiXrayWebhook {
                       "inline": false
                     },
                     {
+                      "name": "Locations",
+                      "value": "```\\n$safePositionsList\\n```",
+                      "inline": false
+                    },
+                    {
                       "name": "Player Inventory",
                       "value": "```\\n$safeInventoryContents\\n```",
                       "inline": false
@@ -167,9 +179,9 @@ object EventAntiXrayWebhook {
                 }
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
 
-            if (cachedMessage != null && consecutiveAlertCount > 1) {
+            if (cachedMessage.messageId.isNotEmpty() && consecutiveAlertCount > 1) {
                 LogDebug.debug("Updating existing webhook message (ID: ${cachedMessage.messageId})", MOD_ID)
                 updateWebhookMessage(fullWebhookUrl, cachedMessage.messageId, jsonPayload)
                 cachedMessage.lastUpdated = Instant.now()
@@ -177,7 +189,8 @@ object EventAntiXrayWebhook {
                 LogDebug.debug("Sending new webhook message", MOD_ID)
                 val messageId = sendNewWebhookMessage(fullWebhookUrl, jsonPayload)
                 if (messageId != null) {
-                    webhookMessageCache[cacheKey] = CachedMessage(messageId, Instant.now())
+                    cachedMessage.messageId = messageId
+                    cachedMessage.lastUpdated = Instant.now()
                     LogDebug.debug("Cached webhook message ID: $messageId for key: $cacheKey", MOD_ID)
                 }
             }
@@ -190,7 +203,7 @@ object EventAntiXrayWebhook {
         var attempts = 0
         while (attempts < 3) {
             try {
-                val sendUrl = "$webhookUrl?wait=true" // Simplified URL handling
+                val sendUrl = "$webhookUrl?wait=true"
                 val url = URL(sendUrl)
                 val connection = url.openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
@@ -220,7 +233,7 @@ object EventAntiXrayWebhook {
                 logger.error("Error sending new webhook message, attempt ${attempts + 1}", e)
             }
             attempts++
-            if (attempts < 3) Thread.sleep(2000) // 2-second delay between retries
+            if (attempts < 3) Thread.sleep(2000)
         }
         logger.error("Failed to send webhook after 3 attempts")
         return null
@@ -230,14 +243,12 @@ object EventAntiXrayWebhook {
         var attempts = 0
         while (attempts < 3) {
             try {
-                // Construct the edit URL for Discord webhooks
                 val editUrl = if (webhookUrl.contains("/api/webhooks/")) {
                     "${webhookUrl}/messages/${messageId}"
                 } else {
                     "https://discord.com/api/webhooks/${webhookUrl}/messages/${messageId}"
                 }
 
-                // Use HttpClient to send a PATCH request
                 val client = HttpClient.newHttpClient()
                 val request = HttpRequest.newBuilder()
                     .uri(URI.create(editUrl))
@@ -269,7 +280,7 @@ object EventAntiXrayWebhook {
             }
 
             attempts++
-            if (attempts < 3) Thread.sleep(2000) // 2-second delay between retries
+            if (attempts < 3) Thread.sleep(2000)
         }
 
         logger.error("Failed to update webhook after 3 attempts")

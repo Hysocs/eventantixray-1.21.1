@@ -6,6 +6,8 @@ import net.minecraft.command.argument.EntityArgumentType
 import net.minecraft.server.command.CommandManager.argument
 import net.minecraft.server.command.ServerCommandSource
 import org.slf4j.LoggerFactory
+import com.eventantixray.utils.DatabaseManager
+import com.eventantixray.utils.EventAntiXrayConfig
 
 object EventAntiXrayCommands {
     private val logger = LoggerFactory.getLogger("EventAntiXray")
@@ -26,15 +28,22 @@ object EventAntiXrayCommands {
 
             subcommand("viewinventory", permission = "antixray.playerinv") {
                 executes { context ->
-                    CommandManager.sendSuccess(context.source, "Usage: /cleanplay viewinventory <player>", false)
+                    CommandManager.sendSuccess(context.source, "Usage: /antixray viewinventory <player>", false)
                     0
                 }
                 then(
                     argument("player", EntityArgumentType.player())
-                    .executes { context ->
-                        viewPlayerInventory(context)
-                    }
+                        .executes { context ->
+                            viewPlayerInventory(context)
+                        }
                 )
+            }
+
+            // New forcesync subcommand
+            subcommand("forcesync", permission = "antixray.forcesync") {
+                executes { context ->
+                    forceSync(context)
+                }
             }
         }
     }
@@ -71,9 +80,37 @@ object EventAntiXrayCommands {
 
     private fun reloadConfig(context: CommandContext<ServerCommandSource>): Int {
         val source = context.source
+        val server = source.server
 
         try {
+            // Check if database was enabled before reload
+            val wasDatabaseEnabled = EventAntiXrayConfig.config.database.enabled
+
+            // Reload the configuration on the main thread
             EventAntiXrayConfig.reloadBlocking()
+
+            // If database was enabled, schedule async task to sync and close
+            if (wasDatabaseEnabled) {
+                DatabaseManager.executor.submit {
+                    try {
+                        DatabaseManager.syncCacheToDatabase()
+                        DatabaseManager.close()
+                    } catch (e: Exception) {
+                        logger.error("Failed to sync cache or close database during reload: ${e.message}")
+                    }
+                }
+            }
+
+            // If database is enabled in the new config, schedule async task to init
+            if (EventAntiXrayConfig.config.database.enabled) {
+                DatabaseManager.executor.submit {
+                    try {
+                        DatabaseManager.init()
+                    } catch (e: Exception) {
+                        logger.error("Failed to initialize database after reload: ${e.message}")
+                    }
+                }
+            }
 
             val trackedBlockCount = EventAntiXrayConfig.config.trackedBlocks.size
 
@@ -117,5 +154,23 @@ object EventAntiXrayCommands {
             logger.error("Error viewing player inventory", e)
             return 0
         }
+    }
+
+    private fun forceSync(context: CommandContext<ServerCommandSource>): Int {
+        val source = context.source
+        if (!EventAntiXrayConfig.config.database.enabled) {
+            CommandManager.sendError(source, "§cDatabase is disabled in the configuration.")
+            return 0
+        }
+        DatabaseManager.executor.submit {
+            try {
+                DatabaseManager.syncCacheToDatabase()
+                logger.info("Database sync forced successfully by ${source.name}")
+            } catch (e: Exception) {
+                logger.error("Failed to force database sync", e)
+            }
+        }
+        CommandManager.sendSuccess(source, "§aDatabase sync has been triggered.", true)
+        return 1
     }
 }

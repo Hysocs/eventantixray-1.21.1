@@ -1,60 +1,69 @@
 package com.eventantixray
 
-import com.everlastingutils.command.CommandManager
+import com.eventantixray.utils.DatabaseManager
 import com.eventantixray.utils.EventAntiXrayCommands
 import com.eventantixray.utils.EventAntiXrayConfig
 import com.eventantixray.utils.EventAntiXrayWebhook
+import com.everlastingutils.command.CommandManager
 import com.everlastingutils.colors.KyoriHelper
 import com.everlastingutils.utils.LogDebug
 import net.fabricmc.api.ModInitializer
-import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents
+import net.fabricmc.fabric.api.event.player.UseBlockCallback
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents
 import net.fabricmc.loader.api.FabricLoader
+import net.minecraft.item.BlockItem
 import net.minecraft.server.MinecraftServer
 import net.minecraft.server.network.ServerPlayerEntity
 import net.minecraft.text.Text
 import net.minecraft.registry.Registries
+import net.minecraft.util.ActionResult
+import net.minecraft.util.Identifier
+import net.minecraft.sound.SoundCategory
+import net.minecraft.util.math.BlockPos
+import net.minecraft.server.world.ServerWorld
 import org.slf4j.LoggerFactory
 import java.time.Duration
 import java.time.Instant
-import java.util.concurrent.ConcurrentHashMap
+import java.time.temporal.ChronoUnit
+import java.util.ArrayDeque
 import java.util.UUID
-import net.minecraft.block.BlockState
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.time.temporal.ChronoUnit
-import net.minecraft.util.Identifier
-import net.minecraft.sound.SoundCategory
 import kotlin.math.pow
 
 class EventAntiXray : ModInitializer {
 	private val logger = LoggerFactory.getLogger("EventAntiXray")
 	private val MOD_ID = "eventantixray"
 
-	// Optimized data structure using a queue for sliding window
+	private data class BlockBreakEvent(val timestamp: Instant, val position: BlockPos)
+
 	private data class BlockBreakData(
-		val queue: ArrayDeque<Instant> = ArrayDeque(),
+		val queue: ArrayDeque<BlockBreakEvent> = ArrayDeque(),
 		var continuousTrackingEnabled: Boolean = false,
 		var lastAlertTime: Instant = Instant.now(),
 		var lastAlertCount: Int = 0,
-		var consecutiveAlertCount: Int = 0  // Track consecutive alerts
+		var consecutiveAlertCount: Int = 0
 	)
+
+	private data class AlertData(
+		val count: Int,
+		val timeWindow: Duration,
+		val consecutiveAlertCount: Int,
+		val recentPos: BlockPos
+	)
+
 	private val alertCache = mutableMapOf<String, Pair<Int, Int>>()
-	// Player UUID -> Block ID (Identifier) -> Break Data
 	private val playerBlockBreaks = ConcurrentHashMap<UUID, MutableMap<Identifier, BlockBreakData>>()
-
-	// Permission cache: UUID -> hasPermission
 	private val permissionCache = ConcurrentHashMap<UUID, Boolean>()
-
-	// Thread pool for webhook requests
-	private val webhookExecutor = Executors.newFixedThreadPool(2) // Adjust size based on server load
-
+	private val webhookExecutor = Executors.newFixedThreadPool(2)
 	private val commandManager = CommandManager("eventantixray")
 
 	override fun onInitialize() {
 		logger.info("EventAntiXray initializing...")
-		LogDebug.debug(MOD_ID, "EventAntiXray initializing...")
+		LogDebug.debug("EventAntiXray initializing...", MOD_ID)
 
 		val configDir = FabricLoader.getInstance().configDir.resolve("eventantixray").toFile()
 		EventAntiXrayConfig.init(configDir)
@@ -66,108 +75,159 @@ class EventAntiXray : ModInitializer {
 		scheduleCleanupTask()
 
 		logger.info("EventAntiXray initialized")
-		LogDebug.debug(MOD_ID, "EventAntiXray initialization complete")
+		LogDebug.debug("EventAntiXray initialization complete", MOD_ID)
 	}
 
 	private fun registerEvents() {
-		LogDebug.debug(MOD_ID, "Registering event handlers")
+		LogDebug.debug("Registering event handlers", MOD_ID)
+
+		ServerLifecycleEvents.SERVER_STARTING.register { server ->
+			LogDebug.debug("Server starting, initializing database and reloading configuration", MOD_ID)
+			DatabaseManager.init()
+			EventAntiXrayConfig.reloadBlocking()
+		}
+
+		ServerLifecycleEvents.SERVER_STOPPING.register { _ ->
+			LogDebug.debug("Server stopping, closing database", MOD_ID)
+			DatabaseManager.close()
+			DatabaseManager.executor.shutdown()
+			try {
+				if (!DatabaseManager.executor.awaitTermination(10, TimeUnit.SECONDS)) {
+					DatabaseManager.executor.shutdownNow()
+					logger.warn("Forcing shutdown of database executor")
+				}
+			} catch (e: InterruptedException) {
+				DatabaseManager.executor.shutdownNow()
+				logger.warn("Database executor shutdown interrupted: ${e.message}")
+			}
+		}
+
+		UseBlockCallback.EVENT.register { player, world, hand, hitResult ->
+			if (!world.isClient && player is ServerPlayerEntity) {
+				val stack = player.getStackInHand(hand)
+				if (stack.item is BlockItem) {
+					val block = (stack.item as BlockItem).block
+					val blockId = Registries.BLOCK.getId(block)
+					if (EventAntiXrayConfig.getTrackedBlock(blockId) != null) {
+						val pos = hitResult.blockPos.offset(hitResult.side)
+						val worldKey = world.registryKey.value.toString()
+						LogDebug.debug("Adding placed block to cache: $worldKey, (${pos.x}, ${pos.y}, ${pos.z}), $blockId", MOD_ID)
+						DatabaseManager.addPlacedBlock(worldKey, pos.x, pos.y, pos.z, blockId.toString())
+					}
+				}
+			}
+			ActionResult.PASS
+		}
 
 		PlayerBlockBreakEvents.AFTER.register { world, player, pos, state, _ ->
 			if (!world.isClient && player is ServerPlayerEntity) {
-				processBlockBreak(player, state)
+				val server = player.server
+				DatabaseManager.executor.submit {
+					processBlockBreakAsync(player, state, pos, world as ServerWorld, server)
+				}
 			}
 			true
-		}
-
-		ServerLifecycleEvents.SERVER_STARTING.register {
-			LogDebug.debug(MOD_ID, "Server starting, reloading configuration")
-			EventAntiXrayConfig.reloadBlocking()
 		}
 
 		ServerPlayConnectionEvents.JOIN.register { handler, _, _ ->
 			val player = handler.player
 			val permissionNode = EventAntiXrayConfig.config.general.notifyPermission
 			val source = player.server.commandSource.withEntity(player).withPosition(player.pos)
-
-			// Use CommandManager to check permissions properly
 			permissionCache[player.uuid] = CommandManager.hasPermissionOrOp(
 				source,
 				permissionNode,
 				EventAntiXrayConfig.config.general.permissionLevel ?: 2,
 				EventAntiXrayConfig.config.general.opLevel ?: 2
 			)
-
-			LogDebug.debug(MOD_ID, "Updated permission cache for ${player.name.string}: ${permissionCache[player.uuid]}")
+			LogDebug.debug("Updated permission cache for ${player.name.string}: ${permissionCache[player.uuid]}", MOD_ID)
 		}
 
 		ServerPlayConnectionEvents.DISCONNECT.register { handler, _ ->
-			LogDebug.debug(MOD_ID, "Player ${handler.player.name.string} disconnected, cleaning up")
+			LogDebug.debug("Player ${handler.player.name.string} disconnected, cleaning up", MOD_ID)
 			playerBlockBreaks.remove(handler.player.uuid)
 			permissionCache.remove(handler.player.uuid)
 		}
 	}
 
-	private fun processBlockBreak(player: ServerPlayerEntity, state: BlockState) {
+	private fun processBlockBreakAsync(player: ServerPlayerEntity, state: net.minecraft.block.BlockState, pos: BlockPos, world: ServerWorld, server: MinecraftServer) {
 		val blockId = Registries.BLOCK.getId(state.block)
 		val trackedBlock = EventAntiXrayConfig.getTrackedBlock(blockId) ?: return
-		LogDebug.debug(MOD_ID, "Player ${player.name.string} broke tracked block $blockId")
-		incrementBlockBreaks(player, blockId)
+
+		val worldId = world.registryKey.value.toString()
+		LogDebug.debug("Checking if block at $pos in $worldId is player-placed for player ${player.name.string}", MOD_ID)
+		val isPlaced = DatabaseManager.isPlayerPlacedSync(worldId, pos)
+		if (isPlaced) {
+			LogDebug.debug("Block at $pos in $worldId is player-placed, removing from cache", MOD_ID)
+			DatabaseManager.removeBlockFromCache(worldId, pos)
+			if (EventAntiXrayConfig.config.database.enabled) {
+				DatabaseManager.removeBlock(worldId, pos)
+			}
+			LogDebug.debug("Player ${player.name.string} broke player-placed block at $pos in $worldId, skipping X-ray detection", MOD_ID)
+			return
+		}
+
+		LogDebug.debug("Player ${player.name.string} broke tracked block $blockId at $pos (confirmed not player-placed)", MOD_ID)
+		val alertData = incrementBlockBreaks(player, blockId, pos)
+		if (alertData != null) {
+			server.execute {
+				alertStaff(player, blockId, alertData.count, alertData.timeWindow, alertData.consecutiveAlertCount, alertData.recentPos)
+			}
+		}
 	}
 
-	private fun incrementBlockBreaks(player: ServerPlayerEntity, blockId: Identifier) {
-		val trackedBlock = EventAntiXrayConfig.getTrackedBlock(blockId) ?: return
+	private fun incrementBlockBreaks(player: ServerPlayerEntity, blockId: Identifier, pos: BlockPos): AlertData? {
+		val trackedBlock = EventAntiXrayConfig.getTrackedBlock(blockId) ?: return null
 		val timeWindowMinutes = trackedBlock.timeWindowMinutes
 		val initialThreshold = trackedBlock.alertThreshold
 		val subsequentThreshold = trackedBlock.subsequentAlertThreshold
 		val resetAfterMinutes = trackedBlock.resetAfterMinutes
 
 		val playerBlocks = playerBlockBreaks.computeIfAbsent(player.uuid) { ConcurrentHashMap() }
-		val blockData = playerBlocks.computeIfAbsent(blockId) { BlockBreakData() }
+		synchronized(playerBlocks) {
+			val blockData = playerBlocks.computeIfAbsent(blockId) { BlockBreakData() }
 
-		val now = Instant.now()
-		blockData.queue.addLast(now)
+			val now = Instant.now()
+			val breakEvent = BlockBreakEvent(now, pos)
+			blockData.queue.addLast(breakEvent)
 
-		val cutoff = now.minus(timeWindowMinutes.toLong(), ChronoUnit.MINUTES)
-		while (blockData.queue.isNotEmpty() && blockData.queue.first() < cutoff) {
-			blockData.queue.removeFirst()
-		}
-		val currentCount = blockData.queue.size
+			val cutoff = now.minus(timeWindowMinutes.toLong(), ChronoUnit.MINUTES)
+			while (blockData.queue.isNotEmpty() && blockData.queue.first().timestamp < cutoff) {
+				blockData.queue.removeFirst()
+			}
+			val currentCount = blockData.queue.size
 
-		if (blockData.continuousTrackingEnabled && resetAfterMinutes > 0) {
-			val resetCutoffTime = blockData.lastAlertTime.plus(resetAfterMinutes.toLong(), ChronoUnit.MINUTES)
-			if (now.isAfter(resetCutoffTime)) {
-				LogDebug.debug(MOD_ID, "Resetting tracking for ${player.name.string} on $blockId after $resetAfterMinutes minutes")
-				blockData.queue.clear()
-				blockData.queue.addLast(now)
-				blockData.continuousTrackingEnabled = false
+			if (blockData.continuousTrackingEnabled && resetAfterMinutes > 0) {
+				val resetCutoffTime = blockData.lastAlertTime.plus(resetAfterMinutes.toLong(), ChronoUnit.MINUTES)
+				if (now.isAfter(resetCutoffTime)) {
+					LogDebug.debug("Resetting tracking for ${player.name.string} on $blockId after $resetAfterMinutes minutes", MOD_ID)
+					blockData.queue.clear()
+					blockData.queue.addLast(BlockBreakEvent(now, pos))
+					blockData.continuousTrackingEnabled = false
+					blockData.lastAlertTime = now
+					blockData.lastAlertCount = 0
+					blockData.consecutiveAlertCount = 0
+					return null
+				}
+			}
+
+			val timeWindow = Duration.ofMinutes(timeWindowMinutes.toLong())
+			if (!blockData.continuousTrackingEnabled && currentCount >= initialThreshold) {
+				blockData.consecutiveAlertCount = 1
+				val recentPos = blockData.queue.last().position
+				val alertData = AlertData(currentCount, timeWindow, blockData.consecutiveAlertCount, recentPos)
+				blockData.continuousTrackingEnabled = true
 				blockData.lastAlertTime = now
-				blockData.lastAlertCount = 0
-				blockData.consecutiveAlertCount = 0
-				return
+				blockData.lastAlertCount = currentCount
+				return alertData
+			} else if (blockData.continuousTrackingEnabled && currentCount >= blockData.lastAlertCount + subsequentThreshold) {
+				blockData.consecutiveAlertCount++
+				val recentPos = blockData.queue.last().position
+				val alertData = AlertData(currentCount, timeWindow, blockData.consecutiveAlertCount, recentPos)
+				blockData.lastAlertTime = now
+				blockData.lastAlertCount = currentCount
+				return alertData
 			}
-		}
-
-		val timeWindow = Duration.ofMinutes(timeWindowMinutes.toLong())
-		if (!blockData.continuousTrackingEnabled && currentCount >= initialThreshold) {
-			blockData.consecutiveAlertCount = 1
-			alertStaff(player, blockId, currentCount, timeWindow, blockData.consecutiveAlertCount)
-			if (EventAntiXrayConfig.config.debug.enabled) {
-				val blockName = EventAntiXrayConfig.getFormattedBlockName(blockId)
-				LogDebug.debug("Possible X-ray detected: ${player.name.string} broke $currentCount $blockName in $timeWindowMinutes minutes", MOD_ID)
-			}
-			blockData.continuousTrackingEnabled = true
-			blockData.lastAlertTime = now
-			blockData.lastAlertCount = currentCount
-		} else if (blockData.continuousTrackingEnabled && currentCount >= blockData.lastAlertCount + subsequentThreshold) {
-			blockData.consecutiveAlertCount++
-			alertStaff(player, blockId, currentCount, timeWindow, blockData.consecutiveAlertCount)
-			if (EventAntiXrayConfig.config.debug.enabled) {
-				val blockName = EventAntiXrayConfig.getFormattedBlockName(blockId)
-				val newBlocks = currentCount - blockData.lastAlertCount
-				LogDebug.debug("Continued X-ray activity: ${player.name.string} broke $newBlocks additional $blockName (total: $currentCount) in $timeWindowMinutes minutes", MOD_ID)
-			}
-			blockData.lastAlertTime = now
-			blockData.lastAlertCount = currentCount
+			return null
 		}
 	}
 
@@ -176,57 +236,41 @@ class EventAntiXray : ModInitializer {
 		blockId: Identifier,
 		count: Int,
 		timeWindow: Duration,
-		consecutiveAlertCount: Int
+		consecutiveAlertCount: Int,
+		recentPos: BlockPos
 	) {
 		val server = player.server
 		val blockName = EventAntiXrayConfig.getFormattedBlockName(blockId)
-
-		// Get the raw message template string
 		val messageTemplate = EventAntiXrayConfig.getAlertMessageForBlock(blockId)
-
-		// Replace the placeholders in the raw string
 		val messageStr = messageTemplate
 			.replace("{player}", player.name.string)
 			.replace("{count}", count.toString())
 			.replace("{time}", "${timeWindow.toMinutes()} minutes")
 			.replace("{block}", blockName)
-
-		// Add the continued prefix if needed
+			.replace("{x}", recentPos.x.toString())
+			.replace("{y}", recentPos.y.toString())
+			.replace("{z}", recentPos.z.toString())
 		val finalMessageStr = if (consecutiveAlertCount > 1) {
 			EventAntiXrayConfig.config.alerts.continuedAlertPrefix + messageStr
 		} else {
 			messageStr
 		}
-
-		// Use KyoriHelper to parse the MiniMessage format
 		val finalMessage = KyoriHelper.parseToMinecraft(finalMessageStr, server.registryManager)
-
-		LogDebug.debug(MOD_ID, "Sending alert to staff for ${player.name.string}, count: $count")
+		LogDebug.debug("Sending alert to staff for ${player.name.string}, count: $count at $recentPos", MOD_ID)
 
 		val soundConfig = EventAntiXrayConfig.config.alerts.sound
-		val soundId = try {
-			Identifier.tryParse(soundConfig.soundId)
-		} catch (e: Exception) {
-			logger.warn("Error parsing sound ID: ${e.message}")
-			null
-		}
+		val soundId = Identifier.tryParse(soundConfig.soundId)
+		val soundEvent = soundId?.let { Registries.SOUND_EVENT.get(it) }
 
-		if (soundId != null) {
-			val soundEvent = Registries.SOUND_EVENT.get(soundId)
-			if (soundEvent != null) {
-				val volume = soundConfig.baseVolume * (soundConfig.volumeMultiplierPerAlert.pow(consecutiveAlertCount - 1))
-				val pitch = soundConfig.basePitch * (soundConfig.pitchMultiplierPerAlert.pow(consecutiveAlertCount - 1))
-				broadcastToStaff(server, finalMessage, soundEvent, volume, pitch)
-			} else {
-				logger.warn("Sound event not found: ${soundConfig.soundId}")
-				broadcastToStaff(server, finalMessage, null, 0f, 0f)
-			}
+		if (soundEvent != null) {
+			val volume = soundConfig.baseVolume * (soundConfig.volumeMultiplierPerAlert.pow(consecutiveAlertCount - 1))
+			val pitch = soundConfig.basePitch * (soundConfig.pitchMultiplierPerAlert.pow(consecutiveAlertCount - 1))
+			broadcastToStaff(server, finalMessage, soundEvent, volume, pitch)
 		} else {
-			logger.warn("Invalid sound ID: ${soundConfig.soundId}")
+			logger.warn("Invalid or missing sound event: ${soundConfig.soundId}")
 			broadcastToStaff(server, finalMessage, null, 0f, 0f)
 		}
 
-		// Asynchronous webhook handling
 		if (EventAntiXrayConfig.config.webhook.enabled && EventAntiXrayConfig.config.webhook.url.isNotEmpty()) {
 			val webhookUrl = EventAntiXrayConfig.config.webhook.url
 			webhookExecutor.submit {
@@ -236,7 +280,8 @@ class EventAntiXray : ModInitializer {
 					blockId,
 					count,
 					timeWindow,
-					consecutiveAlertCount
+					consecutiveAlertCount,
+					recentPos
 				)
 			}
 		}
@@ -267,26 +312,17 @@ class EventAntiXray : ModInitializer {
 		}
 	}
 
-	private fun ServerPlayerEntity.hasPermission(permission: String): Boolean {
-		val source = server.commandSource.withEntity(this).withPosition(pos)
-		return CommandManager.hasPermissionOrOp(
-			source,
-			permission,
-			EventAntiXrayConfig.config.general.permissionLevel ?: 2,
-			EventAntiXrayConfig.config.general.opLevel ?: 2
-		)
-	}
-
 	private fun scheduleCleanupTask() {
-		LogDebug.debug(MOD_ID, "Scheduling cleanup task to run every 5 minutes")
+		LogDebug.debug("Scheduling cleanup task to run every 5 minutes", MOD_ID)
 		Thread {
 			while (true) {
 				try {
 					TimeUnit.MINUTES.sleep(5)
-					LogDebug.debug(MOD_ID, "Running scheduled cleanup task")
+					LogDebug.debug("Running scheduled cleanup task", MOD_ID)
 					cleanupStaleData()
+					DatabaseManager.syncCacheToDatabase() // Always clean cache, sync if database enabled
 				} catch (e: InterruptedException) {
-					LogDebug.debug(MOD_ID, "Cleanup task interrupted")
+					LogDebug.debug("Cleanup task interrupted", MOD_ID)
 					break
 				}
 			}
@@ -299,22 +335,23 @@ class EventAntiXray : ModInitializer {
 	private fun cleanupStaleData() {
 		val now = Instant.now()
 		playerBlockBreaks.forEach { (playerId, blocks) ->
-			val iterator = blocks.entries.iterator()
-			while (iterator.hasNext()) {
-				val (blockId, data) = iterator.next()
-				val timeWindowMinutes = EventAntiXrayConfig.getTrackedBlock(blockId)?.timeWindowMinutes ?: 30
-				val cutoff = now.minus(timeWindowMinutes.toLong(), ChronoUnit.MINUTES)
-				while (data.queue.isNotEmpty() && data.queue.first() < cutoff) {
-					data.queue.removeFirst()
-				}
-				if (data.queue.isEmpty() && !data.continuousTrackingEnabled) {
-					iterator.remove()
+			synchronized(blocks) {
+				val iterator = blocks.entries.iterator()
+				while (iterator.hasNext()) {
+					val (blockId, data) = iterator.next()
+					val timeWindowMinutes = EventAntiXrayConfig.getTrackedBlock(blockId)?.timeWindowMinutes ?: 30
+					val cutoff = now.minus(timeWindowMinutes.toLong(), ChronoUnit.MINUTES)
+					while (data.queue.isNotEmpty() && data.queue.first().timestamp < cutoff) {
+						data.queue.removeFirst()
+					}
+					if (data.queue.isEmpty() && !data.continuousTrackingEnabled) {
+						iterator.remove()
+					}
 				}
 			}
-			if (blocks.isEmpty()) playerBlockBreaks.remove(playerId)
 		}
 		alertCache.clear()
-		LogDebug.debug(MOD_ID, "Cleanup complete")
+		LogDebug.debug("Cleanup complete", MOD_ID)
 	}
 
 	companion object {
